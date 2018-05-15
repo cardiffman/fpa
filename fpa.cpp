@@ -74,12 +74,14 @@ C2 mapfl(const E1& b, const E1& e, UnaryOp f) {
 	return res;
 }
 
-namespace Simple {
+namespace assembly {
 struct AddressMode {
 	enum Mode { Arg, Label, Super, Num, Marker, List };
+#if 0
 	AddressMode(Mode mode, int address) : mode(mode), address(address) {}
 	AddressMode(Mode mode, unsigned address) : mode(mode), address(address) {}
 	AddressMode(Mode mode, size_t address) : mode(mode), address(address) {}
+#endif
 	AddressMode(Mode mode, ptrdiff_t address) : mode(mode), address(address) {}
 	AddressMode(Mode mode, void* address) : mode(mode), address((ptrdiff_t)address) {}
 	AddressMode(Mode mode, const string& dest) : mode(mode), address(0), dest(dest) {}
@@ -112,10 +114,114 @@ struct AddressMode {
 		}
 		return as;
 	}
+	string push() {
+		ostringstream output;
+		output << "# Push " << to_string() << endl;
+		switch (mode) {
+		case Arg:
+		default: throw std::to_string(__LINE__)+" push " + to_string();
+		case Label:
+#if 1
+			output << " movabsq $"<<dest<<",%rsi" << endl;
+			output << " movq %rsi, (%rax) #; push pc" << endl;
+#else
+#if 1
+			if (isdigit(dest[0]))
+				//output << " movabsq "<<dest<<",%rcx" << endl;
+				output << " movq "<<dest<<"(%rip),%rcx" << endl;
+			else
+				//output << " movabsq $"<<dest<<",%rcx" << endl;
+				output << " movq "<<dest<<"(%rip),%rcx" << endl;
+#else
+			if (isdigit(dest[0]))
+				output << " mov "<<dest<<",%rcx" << endl;
+			else
+				output << " mov $"<<dest<<",%rcx" << endl;
+#endif
+			output << " movq %rcx, (%rax) #; push pc" << endl;
+#endif
+			output << " addq $8, %rax;" << endl;
+			output << " mov %rbx, (%rax) #; push frame" << endl;
+			output << " add $8, %rax;";
+			return output.str();
+		case Marker:
+			output << " movq marker"<<address<<"(%rip),%rcx" << endl;
+			output << " movq %rcx,(%rax) #;; rax==sp, push marker0" << endl;
+			output << " addq $8,%rax         #;; sp++"<<endl;
+			output << " mov %rbx,(%rax)    #;; push frame" << endl;
+			output << " add $8,%rax         #;; sp++";// << endl;
+			return output.str();
+		case Num:
+			output << "    movabsq $SELF, %rcx"<<endl;
+			output << "    movq %rcx,(%rax)" << endl;
+			output << "    add $8,%rax" << endl;
+			output << "    movq $" << address << ", (%rax)" << endl;
+			output << "    add $8,%rax";
+			return output.str();
+		case List:
+			{	auto dest = save_pending(*this);
+				return dest.push();
+			}
+			break;
+		}
+		return output.str();
+	}
+	ostream& push(ostream& output) {
+		return output << push();
+	}
+	string enter() {
+		ostringstream output;
+		output << "# Enter " << to_string() << endl;
+		switch (mode) {
+		case Label:
+			output << " jmp " << dest;
+			break;
+		case Super:
+			output << "    jmp " << dest;
+			break;
+		case Arg:
+			// copy frame ptr to rcx
+			// load frame ptr rbx from rbx+8+arg*16
+			// jmp (*rcx)
+			output << "     mov %rbx,%rcx        #;; old frame ptr to rcx" << endl;
+			output << "     mov "<<address*16+8<<"(%rcx),%rbx   #;; new frame pointer to frame ptr" << endl;
+			output << "     jmp *"<<address*16<<"(%rcx) #;; enter arg"<<address;//<<"" << endl;
+			break;
+		case Num:
+			output << "   mov $"<< address << ", %rbx ;; mov value to frame register " << endl;
+			output << "   jmp SELF";
+			break;
+		default: throw std::to_string(__LINE__)+" enter " + to_string();
+		}
+		return output.str();
+	}
+	ostream& enter(ostream& output) {
+		return output << enter();
+    }
+	static void code_pending(ostream& output) {
+		while (pending.size()) {
+			auto next = pending.front(); pending.pop_front();
+			output << next.second << ":" << endl;
+			output << *(string*)next.first.address;
+		}
+	}
+	static AddressMode save_pending(const AddressMode& am) {
+		auto dest = seq_label();
+		AddressMode label(Label, dest);
+		pending.push_back(make_pair(am,dest));
+		return label;
+	}
+	static string seq_label() {
+		return "LCL_"+std::to_string(next_label++);
+	}
+	static int next_label;
+	static list<pair<AddressMode,string>> pending;
 	Mode mode;
 	ptrdiff_t address;
 	string dest;
 };
+int AddressMode::next_label = 0;
+list<pair<AddressMode,string>> AddressMode::pending;
 struct Symbol {
 	explicit Symbol(const AddressMode& addressMode, const string& name, int arguments=0)
 	: addressMode(addressMode), name(name), arguments(arguments) {}
@@ -125,73 +231,6 @@ struct Symbol {
 	int arguments;
 };
 typedef map<string, Symbol> Environment;
-#if 0
-enum {
-	SELF = -1,
-	MARKER = -2
-};
-struct Instruction {
-	enum Ins { Halt, Take, Push, Enter, Op, EnterT };
-	enum Operation { Add, Sub, Mul, Div, Lt };
-	Ins ins;
-	union Params {
-		Params() {}
-		AddressMode mode;
-		unsigned taken;
-		unsigned tag;
-		Operation op;
-		struct {
-			unsigned first;
-			unsigned second;
-		} constructor;
-	} params;
-	Instruction(Ins ins, const AddressMode& mode) : ins(ins) {
-		params.mode = mode;
-	}
-	Instruction(Ins ins, size_t taken) : ins(ins) {
-		params.taken = taken;
-	}
-	Instruction(Ins ins=Halt) : ins(ins) {}
-	Instruction(Operation op) : ins(Op) {
-		params.op = op;
-	}
-	string to_string() const {
-		string instr;
-		switch (ins) {
-		case Take: instr= "Take"; break;
-		case Push: instr= "Push"; break;
-		case Enter: instr= "Enter"; break;
-		case EnterT: instr= "EnterT"; break;
-		case Halt: instr= "Halt"; break;
-		case Op: instr= "Op"; break;
-		default: instr= "isxx"; break;
-		}
-		switch (ins) {
-		case Push:
-		case Enter:
-		case EnterT:
-			instr += " " + params.mode.to_string();
-			break;
-		case Take:
-			instr += " " + std::to_string(params.taken);
-			break;
-		case Op:
-			instr += " ";
-			switch (params.op) {
-			case Add: instr += "Add"; break;
-			case Mul: instr += "Mul"; break;
-			case Sub: instr += "Sub"; break;
-			case Div: instr += "Div"; break;
-			case Lt: instr += "Lt"; break;
-			}
-			break;
-		default:
-			break;
-		}
-		return instr;
-	}
-};
-#endif
 void compileR(Node* expr, ostream& code, Environment& env);
 struct CompileAVisitor : NodeVisitor {
 	void visit(NodeDefine*) {}
@@ -211,7 +250,7 @@ struct CompileAVisitor : NodeVisitor {
 			mode = p->second.addressMode;
 		} else {
 			throw "Can't find " + expr->id + " in compileA";
-			mode = AddressMode(AddressMode::Super, 9999);
+			mode = AddressMode(AddressMode::Super, expr->id);
 		}
 	}
 	void visit(NodeNum* expr) {
@@ -236,9 +275,9 @@ struct CompileRVisitor : NodeVisitor {
 	void visit(NodeCase*){}
 	string addr_to_string(Environment& env, ptrdiff_t addr) {
 		for (auto e : env) {
-			e.first;
-			e.second.addressMode.address;
-			e.second.name;
+			//e.first;
+			//e.second.addressMode.address;
+			//e.second.name;
 			if (e.second.addressMode.mode == AddressMode::Label ||
 					e.second.addressMode.mode == AddressMode::Super) {
 				return e.second.name;
@@ -251,55 +290,17 @@ struct CompileRVisitor : NodeVisitor {
 		for (unsigned n=expr->terms.size()-1; n>0; --n) {
 			auto am = compileA(expr->terms[n].get(), code, env);
 			NLOG("Apply argument term " << expr->terms[n]->to_string() << " using " << am.to_string());
-			switch (am.mode) {
-			case AddressMode::Num:
-				code << "    movq $SELF, (%rax)" << endl;
-				code << "    add $8,%rax" << endl;
-				code << "    movq $" << am.address << ", (%rax)" << endl;
-				code << "    add $8,%rax" << endl;
-				break;
-			case AddressMode::Label:
-				code << "    movq $" << addr_to_string(env,am.address) << ", (%rax)" << endl;
-				code << "    add $8,%rax" << endl;
-				code << "    movq %rbx, (%rax)" << endl;
-				code << "    add $8,%rax" << endl;
-				break;
-			case AddressMode::List:
-				code << "    movq $" << addr_to_string(env,am.address) << ", (%rax) #push list" << endl;
-				code << "    add $8,%rax" << endl;
-				code << "    movq %rbx, (%rax)" << endl;
-				code << "    add $8,%rax" << endl;
-				//throw to_string(__LINE__)+ " push List" + *(string*)am.address;
-				break;
-			default:
-				throw "push "+am.to_string()+' '+addr_to_string(env,am.address); //code.push_back(Instruction(Instruction::Push, am));
-			}
+			code << am.push() << endl;
 		}
 		NLOG("Apply fn term " << expr->terms[0]->to_string());
 		compileR(expr->terms[0].get(), code, env);
 	}
 	void visit(NodeId* expr) {
 		auto am = compileA(expr, code, env);
-		switch (am.mode) {
-		case AddressMode::Super:
-			code << "    jmp " << am.dest << endl;
-			break;
-		default:
-			if (am.mode == AddressMode::List) {
-				throw "enter " + am.to_string();//append(code, *(list<Instruction>*)am.address);
-			} else {
-				throw "enter " + am.to_string();//code.push_back(Instruction(Instruction::Enter, am));
-			}
-		}
+		code << am.enter() << endl;
 	}
 	void visit(NodeNum* expr) {
-		// what pushing a number looks like
-		//code << "    movq $SELF, [$rax]" << endl;
-		//code << "    add $8,%rax" << endl;
-		//code << "    movq $" << expr->value << ", [$rax]" << endl;
-		//code << "    add $8,%rax" << endl;
-		code << "   movq $"<< expr->value << ", %rbx ;; mov value to frame register " << endl;
-		code << "   jmp SELF" << endl;
+		code << AddressMode(AddressMode::Num, expr->value).enter() << endl;
 	}
 	CompileRVisitor(ostream& code, Environment& env) : code(code), env(env) {}
 	ostream& code;
@@ -312,10 +313,12 @@ void compileR(Node* expr, ostream& code, Environment& env) {
 void compileR(const shared_ptr<Node>& expr, ostream& code, Environment& env) {
 	compileR(expr.get(), code, env);
 }
-void compileSC(const CoreScDefn& def, ostream& code, Environment& env) {
+void compileSC(const CoreScDefn& def, ostream& code, const Environment& env) {
 	NLOG("Generating take instr with " << def.args.size() << " slots ");
-	code << "    mov $" << def.args.size() << ",%rcx" << endl;
-	code << "    call take" << endl;
+	if (def.args.size()) {
+		code << "    mov $" << def.args.size() << ",%rcx" << endl;
+		code << "    call take" << endl;
+	}
 	Environment new_env = env;
 	int kArg = 0;
 	for (auto arg: def.args) {
@@ -328,157 +331,8 @@ void compileSC(const CoreScDefn& def, ostream& code, Environment& env) {
 		++kArg;
 	}
 	compileR(def.expr, code, new_env);
+	AddressMode::code_pending(code);
 }
-#if 0
-void State::step() {
-	if (stopped())
-		return;
-	const Instruction& ins = code[pc++];
-	switch (ins.ins) {
-	case Instruction::Take:
-		if (ins.params.taken != 0) {
-			fptr.frame = new Frame();
-			fptr.frame->elements.resize(ins.params.taken);
-			for (unsigned i=0; i<ins.params.taken; ++i) {
-				fptr.frame->elements[i] = closureStack.back();
-				closureStack.pop_back();
-			}
-		}
-		break;
-	case Instruction::Push:
-		switch (ins.params.mode.mode) {
-		case AddressMode::Label:
-			closureStack.push_back(new Closure());
-			closureStack.back()->address = ins.params.mode.address;
-			closureStack.back()->fptr = fptr;
-			break;
-		case AddressMode::Super:
-			closureStack.push_back(new Closure());
-			closureStack.back()->address = ins.params.mode.address;
-			closureStack.back()->fptr.frame = 0;
-			break;
-		case AddressMode::Num:
-			closureStack.push_back(new Closure());
-			closureStack.back()->address = -1;
-			closureStack.back()->fptr.value = ins.params.mode.address;
-			break;
-		case AddressMode::Arg:
-			closureStack.push_back(fptr.frame->elements[ins.params.mode.address]);
-			break;
-		case AddressMode::List:
-			throw "List address mode shouldn't be executed";
-		case AddressMode::Marker:
-			//LOG("Not handling marker yet");
-			closureStack.push_back(new Closure());
-			closureStack.back()->address = MARKER - ins.params.mode.address;
-			closureStack.back()->fptr = fptr;//.value = ins.params.mode.address;
-			break;
-		}
-		break;
-	case Instruction::Enter:
-		switch (ins.params.mode.mode) {
-		case AddressMode::Label:
-			pc = ins.params.mode.address;
-			break;
-		case AddressMode::Super:
-			pc = ins.params.mode.address;
-			break;
-		case AddressMode::Arg:
-			pc = fptr.frame->elements[ins.params.mode.address]->address;
-			fptr = fptr.frame->elements[ins.params.mode.address]->fptr;
-			//if (pc < 0) {
-			//	LOG("PC is negative: " << pc << ',' << fptr.value);
-			//}
-			break;
-		case AddressMode::Num:
-			pc = -1;
-			fptr.value = ins.params.mode.address;
-			break;
-		case AddressMode::List:
-			throw "List address mode shouldn't be executed";
-		}
-		break;
-	case Instruction::EnterT: {
-		auto tos = closureStack.back(); closureStack.pop_back();
-		if (tos->address == SELF && tos->fptr.value != 0) {
-			switch (ins.params.mode.mode) {
-			case AddressMode::Label:
-				pc = ins.params.mode.address;
-				break;
-			case AddressMode::Super:
-				pc = ins.params.mode.address;
-				break;
-			case AddressMode::Arg:
-				pc = fptr.frame->elements[ins.params.mode.address]->address;
-				fptr = fptr.frame->elements[ins.params.mode.address]->fptr;
-				//if (pc < 0) {
-				//	LOG("PC is negative: " << pc << ',' << fptr.value);
-				//}
-				break;
-			case AddressMode::Num:
-				pc = -1;
-				fptr.value = ins.params.mode.address;
-				break;
-			case AddressMode::List:
-				throw "List address mode shouldn't be executed";
-			}
-			break;
-		}
-		}
-		break;
-	case Instruction::Op: {
-		auto left = closureStack.back(); closureStack.pop_back();
-		auto right = closureStack.back(); closureStack.pop_back();
-		pc = -1;
-		switch (ins.params.op) {
-		case Instruction::Add:
-		fptr.value = left->fptr.value + right->fptr.value;
-		break;
-		case Instruction::Mul:
-		fptr.value = left->fptr.value * right->fptr.value;
-		break;
-		case Instruction::Sub:
-		fptr.value = left->fptr.value - right->fptr.value;
-		break;
-		case Instruction::Div:
-		fptr.value = left->fptr.value / right->fptr.value;
-		break;
-		case Instruction::Lt:
-		fptr.value = left->fptr.value < right->fptr.value;
-		break;
-		}
-		break;
-	}
-	}
-	while (pc < 0) {
-		//LOG("PC is negative: " << pc << ',' << fptr.value);
-		//LOG("TOS " << closureStack.back()->address << "|" << closureStack.back()->fptr.value);
-		while (closureStack.back()->address <= MARKER) {
-			auto oldClosure = closureStack.back();
-			closureStack.pop_back();
-			int i = MARKER - oldClosure->address;
-			//LOG("Updating marked frame element " << i << " based on address " << oldClosure->address);
-			//LOG("The frame element will become " << pc << "," << fptr.frame);
-			oldClosure->fptr.frame->elements[i]->address = pc;
-			oldClosure->fptr.frame->elements[i]->fptr = fptr;
-			//throw "About to enter SELF with marker on stack";
-			//LOG(" pc is " << pc);
-		}
-		//LOG("PC is negative: " << pc << ',' << fptr.value);
-		if (pc == -1){//else {
-			//LOG("Traditional handling of SELF: " << pc << ',' << fptr.value);
-			auto oldClosure = closureStack.back();
-			closureStack.pop_back();
-			auto newClosure = new Closure();
-			newClosure->address = pc;
-			newClosure->fptr = fptr;
-			closureStack.push_back(newClosure);
-			pc = oldClosure->address;
-			fptr = oldClosure->fptr;
-		}
-	}
-}
-#endif
 string labelize(const string& name) {
 	string out="L_";
 	for (auto c : name) {
@@ -492,58 +346,51 @@ string labelize(const string& name) {
 	return out;
 }
 void addRtl(ostream& output) {
-	output << "# Assembly code implemnting TIM take/push/enter" << endl;
-	output << "# rax is the stack pointer, pushing to stack increases rax" << endl;
-	output << "# rbx is the frame pointer, Arg 0 will be at rbx, Arg 1 at 8(rbx)" << endl;
-	output << "# Any 'non-linear' flow is done explicitly with enter, translated to some jmp" << endl;
-	output << "# Thus any need for control to 'return' needs to be done explicitly by pushing" << endl;
-	output << "# the desired destination using equivalent of push label, and best push closure" << endl;
-	output << "take:" << endl;
-	output << "	mov aptr(%rip), %rbx" << endl;
-	output << "	mov %rbx,cframe(%rip)" << endl;
-	output << "	lea (%rbx,%rcx,8), %rbx" << endl;
-	output << "	mov %rbx,aptr(%rip)" << endl;
-
-	output << "	mov tos(%rip), %rbx" << endl;
-	output << "	rep movsd" << endl;
-	output << "	ret" << endl;
-	output << "	" << endl;
-	output << "SELF:" << endl;
-	output << "	# We come here upon entering certain closures." << endl;
-	output << "	# The intention is to end up with the entered closure transfered to the stack" << endl;
-	output << "	# and the closure that was on top gets popped and enterd." << endl;
-	output << "	# The intention is to enter the closure on top of the stack, but replace it" << endl;
-	output << "	# with the SELF PC and value." << endl;
-	output << "	# One implementation had this code:" << endl;
-		/*
-			struct Closure* top = head(stack);
-			stack = tail(stack);
-			struct Closure* n = NEW(struct Closure);
-			n->pc = state.pc;
-			n->value = state.value;
-			stack = cons(n, stack);
-			state = *top;
-		*/
-	output << "	ret" << endl;
+	ifstream rtl;
+	rtl.open("rtl.s", ios::in);
+	while (rtl.good()) {
+		string ln;
+		getline(rtl, ln);
+		output << ln << endl;
+	}
 }
 void addoper(ostream& output, const string& name) {
 	output << labelize(name)<<": #" << name << endl;
 	output << "    mov $2,%rcx" << endl;
 	output << "    call take" << endl;
-	output << "    movq $1f, (%rax) #; push pc" << endl;
+#if 1
+	output << AddressMode(AddressMode::Label,"1f").push() << endl;
+	output << AddressMode(AddressMode::Label,"SI1").enter() << endl;
+	output << "1: "<<AddressMode(AddressMode::Label,"2f").push() << endl;
+	output << AddressMode(AddressMode::Label,"SI0").enter() << endl;
+#else
+	output << "    movq 1f(%rip),%rcx" << endl;
+	output << "    movq %rcx, (%rax) #; push pc" << endl;
 	output << "    add $8, %rax;" << endl;
 	output << "    mov %rbx, (%rax) #; push frame" << endl;
 	output << "    add $8, %rax;" << endl;
 	output << "    jmp SI1" << endl;
-	output << "1:  movq $2f, (%rax) #; push pc" << endl;
+	output << "1:  movq 2f(%rip), %rcx" << endl;
+	output << "    movq %rcx, (%rax) #; push pc" << endl;
 	output << "    add $8, %rax;" << endl;
 	output << "    mov %rbx, (%rax) #; push frame" << endl;
 	output << "    add $8, %rax;" << endl;
 	output << "    jmp SI0" << endl;
+#endif
 	output << "2: #;; [rax+8] is left [rax+24] is right" << endl;
 	if (name == "+") {
 		output << "    mov 8(%rax),%rcx" << endl;
 		output << "    add 24(%rax),%rcx" << endl;
+	} else if (name == "-") {
+		output << "    mov 8(%rax),%rcx" << endl;
+		output << "    sub 24(%rax),%rcx" << endl;
+	} else if (name == "<") {
+		output << "    mov 8(%rax),%rcx" << endl;
+		output << "    cmp 24(%rax),%rcx" << endl;
+		output << "    mov $0,%rcx" << endl;
+		output << "    jnz 1f" << endl;
+		output << "    add $1,%rcx" << endl;
+		output << "1:" << endl;
 	} else {
 		output << "###;;; code needed for operator " << name << endl;
 	}
@@ -552,30 +399,32 @@ void addoper(ostream& output, const string& name) {
 }
 
 void addcond(ostream& output) {
-#if 0
-	auto rel = state.code.size();
-	append(state.code, vector<Instruction>{
-		Instruction(Instruction::Take,3),
-		Instruction(Instruction::Push,AddressMode(AddressMode::Label,rel+3)),
-		Instruction(Instruction::Enter,AddressMode(AddressMode::Label, 0)),
-		Instruction(Instruction::EnterT,AddressMode(AddressMode::Label, 2)),
-		Instruction(Instruction::Enter,AddressMode(AddressMode::Label, 4)),
-	});
-	env["cond"] = Symbol(AddressMode(AddressMode::Super,rel),3);
-#endif
-	output << labelize("if")<<": #" << "if" << endl;
-	output << "    mov $2,%rcx" << endl;
+	output << "cond: ## TK" << endl;
+	output << "if: ## TK" << endl;
+	output << "    mov $3,%rcx" << endl;
 	output << "    call take" << endl;
-	output << "    movq $1f, (%rax) #; push pc" << endl;
-	output << "    add $8, %rax;" << endl;
-	output << "    mov %rbx, (%rax) #; push frame" << endl;
-	output << "    add $8, %rax;" << endl;
-	output << "    jmp SI0" << endl;
-	output << "    test 8(%rax) #get truth" << endl;
-	output << "    jmpz $1f #go do false action" << endl;
+	output << AddressMode(AddressMode::Label,"1f").push() << endl;
+	output << AddressMode(AddressMode::Label, "SI0").enter() << endl;
+	output << "1:" << endl;
+	output << " ## This needs to pop the result!" << endl;
+	output << "	xor %rcx,%rcx" << endl;
+	output << "   test %rcx,8(%rax) #get truth" << endl;
+	output << "   jz 2f #go do false action" << endl;
 	output << " # enter 2nd arg if true" << endl;
-	output << " # thus mov 8(rbx) to "
-	output << "    mov "
+	output << " # thus mov 8(rbx) to rbx jmp 0(rbx)" << endl;
+	output << AddressMode(AddressMode::Arg, 1).enter() << endl;
+	output << "2:" << endl;
+	output << AddressMode(AddressMode::Arg, 2).enter() << endl;
+}
+template <class T>
+unsigned maxArgs(const T& defs) {
+	unsigned m = 3;
+	for (auto def: defs) {
+		if (def.args.size() > m) {
+			m = def.args.size();
+		}
+	}
+	return m;
 }
 }
 int main(int argc, char** argv) {
@@ -611,72 +460,54 @@ int main(int argc, char** argv) {
 	read.next();
 
 	//vector<Instruction> code;
-	using namespace Simple;
+	using namespace assembly;
 	//State state;
 	try {
 		auto defcode = Definitions(read);
+		auto max_args = maxArgs(defcode);
 		Environment env;
 		addRtl(output);
-		for (int i=0; i<3; ++i) {
-			output << "marker" << i<<":" << endl;
+		for (unsigned i=0; i<max_args; ++i) {
+			output << "marker" << i<<": ret" << endl;
 		}
-		for (int i=0; i<3; ++i) {
-			output << "SI"<<i<<": movq $marker"<<i<<",(%rax) #;; rax==sp, push marker0" << endl;
-			output << "     add $8,%rax         #;; sp++"<<endl;
+		for (unsigned i=0; i<max_args; ++i) {
+#if 1
+			output << "SI"<<i<<": ";
+#if 0
+			output << AddressMode(AddressMode::Marker,i).push();
+#endif
+			output << endl;
+			output << " " << AddressMode(AddressMode::Arg, i).enter() << endl;
+#else
+			output << "SI"<<i<<": " << AddressMode(AddressMode::Marker,i).push() << endl;
+			output << "SI"<<i<<": movq marker"<<i<<"(%rip),%rcx" << endl;
+			output << "     movq %rcx,(%rax) #;; rax==sp, push marker0" << endl;
+			output << "     addq $8,%rax         #;; sp++"<<endl;
 			output << "     mov %rbx,(%rax)    #;; push frame" << endl;
 			output << "     add $8,%rax         #;; sp++" << endl;
 			output << "     mov %rbx,%rcx        #;; old frame ptr to rcx" << endl;
 			output << "     mov "<<i*16+8<<"(%rcx),%rbx   #;; new frame pointer to frame ptr" << endl;
 			output << "     jmp *"<<i*16<<"(%rcx) #;; enter arg"<<i<<"" << endl;
+#endif
 		}
-		addoper(output, "+"); env["+"] = Symbol(AddressMode(AddressMode::Super, labelize("+")),labelize("+"));
-		addoper(output, "-"); env["-"] = Symbol(AddressMode(AddressMode::Super, labelize("-")),labelize("-"));
-		addoper(output, "*"); env["*"] = Symbol(AddressMode(AddressMode::Super, labelize("*")),labelize("*"));
-		addoper(output, "/"); env["/"] = Symbol(AddressMode(AddressMode::Super, labelize("/")),labelize("/"));
-		addoper(output, "<"); env["<"] = Symbol(AddressMode(AddressMode::Super, labelize("<")),labelize("<"));
-		addcond(output);      env["if"]= Symbol(AddressMode(AddressMode::Super, labelize("if")),labelize("if"));
+		addoper(output, "+"); env["+"] = Symbol(AddressMode(AddressMode::Super, labelize("+")), "+", 2);
+		addoper(output, "-"); env["-"] = Symbol(AddressMode(AddressMode::Super, labelize("-")), labelize("-"), 2);
+		addoper(output, "*"); env["*"] = Symbol(AddressMode(AddressMode::Super, labelize("*")), "*", 2);
+		addoper(output, "/"); env["/"] = Symbol(AddressMode(AddressMode::Super, labelize("/")), "/", 2);
+		addoper(output, "<"); env["<"] = Symbol(AddressMode(AddressMode::Super, labelize("<")), "<", 2);
+		addcond(output); env["if"] = Symbol(AddressMode(AddressMode::Super, "if"),"if", 2);
 
 		for (auto def : defcode) {
-#if 1
 			NLOG("def->to_string: " << def.to_string());
 			env[def.name] = Symbol(AddressMode(AddressMode::Super, def.name), def.name, def.args.size());
 			output << def.name<<":" << endl;
 			compileSC(def,output, env);
-#if 0
-			auto start = state.code.size();
-			env[def.name] = Symbol(AddressMode(AddressMode::Super, start), def.args.size());
-			auto instrs = compileSC(def, env);
-			NLOG(join(mapf(instrs.begin(), instrs.end(), [](auto const& i){return i.to_string();}),'\n'));
-			start = state.code.size();
-			env[def.name] = Symbol(AddressMode(AddressMode::Super, start), def.args.size());
-			state.code.insert(state.code.end(), instrs.begin(), instrs.end());
-			for (unsigned i = 0; i<state.code.size(); ++i) {
-				switch (state.code[i].ins) {
-				case Instruction::Push:
-				case Instruction::Enter:
-					if (state.code[i].params.mode.mode == AddressMode::List) {
-						unsigned target = state.code.size();
-						const list<Instruction>& to_add = *(list<Instruction>*)(state.code[i].params.mode.address);
-						state.code.insert(state.code.end(), to_add.begin(), to_add.end());
-						state.code[i].params.mode = AddressMode(AddressMode::Label, target);
-					}
-					break;
-				default:
-					break;
-				}
-			}
-#endif
 		}
-#if 0
-		auto start = state.code.size();
-		auto theMain = env["main"].addressMode;
-		state.code.push_back(Instruction(Instruction::Push,AddressMode(AddressMode::Label, start+2)));
-		state.code.push_back(Instruction(Instruction::Enter,theMain));
-		state.code.push_back(Instruction(Instruction::Halt));
-#endif
+		output << ".global start" << endl;
 		output << "start:" << endl;
-		output << "     mov $frame, %rbx;" << endl;
-		output << "     mov $stack, %rax;" << endl;
+		output << "     lea frame(%rip), %rbx;" << endl;
+		output << "     mov %rbx, fptr(%rip)" << endl;
+		output << "     lea stack(%rip), %rax;" << endl;
 		output << "     jmp main" << endl;
 
 	} catch (const char* ex) {
@@ -686,6 +517,3 @@ int main(int argc, char** argv) {
 	}
 	return 0;
 }
-#endif
-
-
